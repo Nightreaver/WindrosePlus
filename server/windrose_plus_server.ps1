@@ -65,6 +65,10 @@ if (-not $BindIp -and $config.server -and $config.server.bind_ip) {
 }
 $BindIp = $BindIp.Trim()
 
+# Opt-in: serve the live map (page + JSON + tiles) without authentication.
+# Read once at startup; flipping it in windrose_plus.json requires a dashboard restart.
+$publicLiveMap = [bool]$config.server.public_livemap
+
 $listenHost = "+"
 if ($BindIp -and $BindIp -ne "0.0.0.0" -and $BindIp -ne "*" -and $BindIp -ne "+") {
     $listenHost = $BindIp
@@ -189,6 +193,9 @@ Write-Host "Data directory: $dataDir"
 Write-Host ""
 Write-Host ("Dashboard:  http://{0}:{1}/" -f $dashboardHost, $Port)
 Write-Host ("API:        http://{0}:{1}/api/status" -f $dashboardHost, $Port)
+if ($publicLiveMap) {
+    Write-Host ("Public Map: http://{0}:{1}/livemap (no login)" -f $dashboardHost, $Port)
+}
 Write-Host ""
 
 # Start HTTP listener
@@ -612,33 +619,43 @@ try {
                 continue
             }
 
+            # Opt-in: live-map routes (HTML, JSON, tiles) skip auth when public_livemap=true
+            $skipAuth = $publicLiveMap -and (
+                $path -eq "/livemap" -or
+                $path -eq "/api/livemap" -or
+                $path -eq "/api/mapinfo" -or
+                $path -match "^/livemap/tiles/\d+/\d+-\d+\.png$"
+            )
+
             # All other routes require authentication
-            $currentPassword = Get-CurrentRconPassword
-            if ($null -eq $currentPassword) {
-                if ($path.StartsWith("/api/")) {
-                    Send-Json $context @{ error = "Config temporarily unavailable, retry in a moment" } 503
-                } else {
-                    Send-Redirect $context "/login"
+            if (-not $skipAuth) {
+                $currentPassword = Get-CurrentRconPassword
+                if ($null -eq $currentPassword) {
+                    if ($path.StartsWith("/api/")) {
+                        Send-Json $context @{ error = "Config temporarily unavailable, retry in a moment" } 503
+                    } else {
+                        Send-Redirect $context "/login"
+                    }
+                    continue
                 }
-                continue
-            }
-            if (-not $currentPassword -or $currentPassword -eq "changeme") {
-                # No password configured or still default — block everything
-                if ($path.StartsWith("/api/")) {
-                    Send-Json $context @{ error = "No password configured. Set a password in windrose_plus.json to access the dashboard." } 403
-                } else {
-                    Send-Redirect $context "/login"
+                if (-not $currentPassword -or $currentPassword -eq "changeme") {
+                    # No password configured or still default — block everything
+                    if ($path.StartsWith("/api/")) {
+                        Send-Json $context @{ error = "No password configured. Set a password in windrose_plus.json to access the dashboard." } 403
+                    } else {
+                        Send-Redirect $context "/login"
+                    }
+                    continue
                 }
-                continue
-            }
-            if (-not (Test-SessionToken (Get-SessionFromCookies $context.Request))) {
-                # API calls get 401, browser requests get redirect
-                if ($path.StartsWith("/api/")) {
-                    Send-Json $context @{ error = "Authentication required" } 401
-                } else {
-                    Send-Redirect $context "/login"
+                if (-not (Test-SessionToken (Get-SessionFromCookies $context.Request))) {
+                    # API calls get 401, browser requests get redirect
+                    if ($path.StartsWith("/api/")) {
+                        Send-Json $context @{ error = "Authentication required" } 401
+                    } else {
+                        Send-Redirect $context "/login"
+                    }
+                    continue
                 }
-                continue
             }
 
             switch ($path) {

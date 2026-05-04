@@ -25,6 +25,7 @@ Dashboard listener settings.
 |-----|---------|-------------|
 | `http_port` | `8780` | Dashboard/API HTTP port. You can also pass `-Port` to `start_dashboard.bat`. |
 | `bind_ip` | `""` | Optional IP address to bind the dashboard to on multi-IP hosts. Empty means all interfaces when elevated, with localhost fallback. You can also pass `-BindIp` to `start_dashboard.bat`. |
+| `public_livemap` | `false` | Set `true` to serve the Sea Chart at `/livemap` (and the `/api/livemap`, `/api/mapinfo`, and tile PNGs it depends on) without requiring an RCON-password login. The dashboard, console, RCON API, repair page, and config endpoints stay locked. Read once at dashboard startup — flip it and restart `start_dashboard.bat` for the change to take effect. **Privacy note:** anyone with the URL sees live player positions refreshing every 5 seconds. |
 
 Example:
 

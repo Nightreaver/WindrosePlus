@@ -216,7 +216,7 @@ end
 
 function Config._defaults()
     return {
-        server = { http_port = 8780, bind_ip = "" },
+        server = { http_port = 8780, bind_ip = "", public_livemap = false },
         rcon = { enabled = false, port = 27320, password = "" },
         query = { enabled = true, interval_ms = 5000, idle_interval_ms = 30000 },
         livemap = { enabled = true, player_interval_ms = 5000, entity_interval_ms = 30000 },
