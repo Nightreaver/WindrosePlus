@@ -10,6 +10,10 @@ param(
 # release time. The literal here is the development default.
 $Version = "1.0.16"
 
+# Process exit code that signals the looping wrapper batch to relaunch us.
+# Used by the dashboard restart watcher (wp.update path).
+$ExitCodeRestart = 50
+
 # Find game directory
 function Find-GameDir {
     $candidates = @()
@@ -353,6 +357,45 @@ Register-ObjectEvent $tileGenTimer Elapsed -Action {
     }
 } | Out-Null
 $tileGenTimer.Start()
+
+# Dashboard restart watcher.
+# Lua's `wp.update` writes a trigger file; we exit with $ExitCodeRestart so the
+# wrapper batch (start_dashboard.bat / start_windrose_plus.bat) re-launches
+# us. Game server stays up — only this process dies + respawns.
+$dashRestartTrigger = Join-Path $dataDir "dashboard_restart_trigger"
+
+# Clear any stale trigger left behind by a crashed wrapper or operator drop.
+# Without this, the very first watcher tick would exit and we'd boot-loop
+# until something (or someone) cleaned it up by hand.
+if (Test-Path -LiteralPath $dashRestartTrigger) {
+    try { Remove-Item -LiteralPath $dashRestartTrigger -Force -ErrorAction Stop }
+    catch { Write-Host "WARN: stale dashboard_restart_trigger could not be removed at startup ($($_.Exception.Message)); watcher will retry." }
+}
+
+$dashRestartTimer = New-Object System.Timers.Timer
+$dashRestartTimer.Interval = 2000
+$dashRestartTimer.AutoReset = $true
+Register-ObjectEvent $dashRestartTimer Elapsed -Action {
+    if (Test-Path -LiteralPath $dashRestartTrigger) {
+        # Only exit if we actually managed to delete the trigger. If the delete
+        # keeps failing (lock / AV / perms), exiting anyway would boot-loop the
+        # dashboard — let the next tick retry instead.
+        $removed = $false
+        try {
+            Remove-Item -LiteralPath $dashRestartTrigger -Force -ErrorAction Stop
+            $removed = $true
+        } catch {
+            Write-Host "WARN: failed to remove dashboard_restart_trigger ($($_.Exception.Message)); skipping exit to avoid boot loop."
+        }
+        if ($removed) {
+            Write-Host "Dashboard restart triggered — exiting (wrapper relaunches)..."
+            try { $listener.Stop() } catch {}
+            # Hard-exit from the timer thread. The wrapper sees the exit code and re-launches.
+            [Environment]::Exit($ExitCodeRestart)
+        }
+    }
+} | Out-Null
+$dashRestartTimer.Start()
 
 function Send-Json($context, $data, $statusCode = 200) {
     $json = if ($null -eq $data) { '{}' } else { $data | ConvertTo-Json -Depth 10 -Compress }

@@ -179,6 +179,48 @@ function Admin._registerCommands()
         end
     }
 
+    -- Reload BOTH halves of Windrose+ (Lua mod + dashboard process) in place
+    -- after a code update — without bouncing the game server. The dashboard
+    -- side requires the looping wrapper (start_dashboard.bat from install.ps1
+    -- 1.1.18+, or server/start_windrose_plus.bat) to relaunch on exit 50.
+    -- Order matters: write the dashboard trigger FIRST (the wrapper picks it
+    -- up asynchronously within ~2s), THEN schedule the Lua RestartMod a
+    -- moment later so this RCON response actually returns before the VM is
+    -- torn down.
+    Admin._commands["wp.update"] = {
+        description = "Reload Windrose+ (Lua mod + dashboard) without restarting the game",
+        usage = "wp.update",
+        category = "server",
+        examples = {"wp.update"},
+        handler = function(args)
+            local lines = {}
+            local gameDir = Admin._gameDir or ".\\"
+            local triggerPath = gameDir .. "windrose_plus_data\\dashboard_restart_trigger"
+            local f = io.open(triggerPath, "w")
+            if f then
+                f:write("update")
+                f:close()
+                table.insert(lines, "Dashboard restart trigger written; wrapper relaunches within ~2s (requires loop wrapper from install.ps1 1.1.18+ or server/start_windrose_plus.bat).")
+            else
+                table.insert(lines, "WARN: failed to write dashboard restart trigger at " .. triggerPath)
+            end
+
+            if RestartMod and LoopAsync then
+                -- Defer RestartMod so this response actually returns before
+                -- the Lua VM is torn down. One-shot LoopAsync.
+                LoopAsync(750, function()
+                    pcall(RestartMod, "WindrosePlus")
+                    return true
+                end)
+                table.insert(lines, "Lua mod restart scheduled in ~750ms. Commands / hooks / tick callbacks reload from Scripts/.")
+            else
+                table.insert(lines, "WARN: RestartMod or LoopAsync unavailable in this UE4SS build — Lua mod NOT restarted.")
+            end
+            table.insert(lines, "Note: PAK changes (multipliers/curves) require a full server restart to take effect.")
+            return table.concat(lines, "\n")
+        end
+    }
+
     Admin._commands["wp.version"] = {
         description = "Show version",
         usage = "wp.version",

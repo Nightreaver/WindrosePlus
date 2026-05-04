@@ -270,9 +270,19 @@ try {
         }
     }
 
-    # Create dashboard launcher
+    # Create dashboard launcher (loop on exit code 50 so wp.update can
+    # restart the dashboard in-place without operator intervention)
     $dashBat = Join-Path $wpDir "start_dashboard.bat"
-    Set-Content $dashBat "@echo off`npowershell -ExecutionPolicy Bypass -File `"%~dp0server\windrose_plus_server.ps1`" -GameDir `"$gameDir`" %*"
+    $dashBatContent = @"
+@echo off
+:loop
+powershell -ExecutionPolicy Bypass -File "%~dp0server\windrose_plus_server.ps1" -GameDir "$gameDir" %*
+if %errorlevel% equ 50 (
+    echo [wrapper] Dashboard requested restart, relaunching...
+    goto loop
+)
+"@
+    Set-Content $dashBat $dashBatContent
 
     Write-Host " done" -ForegroundColor Green
 } catch {
