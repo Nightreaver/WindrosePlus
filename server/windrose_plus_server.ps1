@@ -528,7 +528,7 @@ function Send-File($context, $filePath) {
     $mimeTypes = @{
         ".html" = "text/html"; ".css" = "text/css"; ".js" = "application/javascript"
         ".json" = "application/json"; ".png" = "image/png"; ".jpg" = "image/jpeg"
-        ".svg" = "image/svg+xml"; ".ico" = "image/x-icon"
+        ".svg" = "image/svg+xml"; ".ico" = "image/x-icon"; ".webp" = "image/webp"
     }
     $mime = if ($mimeTypes[$ext]) { $mimeTypes[$ext] } else { "application/octet-stream" }
     $context.Response.ContentType = $mime
@@ -730,6 +730,17 @@ try {
                     continue
                 }
 
+                if ($path -eq "/api/public/pois") {
+                    $poisFile = Join-Path $dataDir "pois.json"
+                    if (Test-Path -LiteralPath $poisFile) {
+                        $data = Get-Content $poisFile -Raw | ConvertFrom-Json
+                        Send-Json $context $data
+                    } else {
+                        Send-Json $context @{ error = "No POI data" }
+                    }
+                    continue
+                }
+
                 if ($path -eq "/api/public/mapinfo") {
                     $mapCoordsFile = Join-Path $dataDir "map_coords.json"
                     if (Test-Path -LiteralPath $mapCoordsFile) {
@@ -752,6 +763,12 @@ try {
                 if ($path -match "^/public-map/tiles/(\d+)/(\d+)-(\d+)\.png$") {
                     $tilePath = Join-Path $dataDir "map_tiles\$($Matches[1])\$($Matches[2])-$($Matches[3]).png"
                     Send-File $context $tilePath
+                    continue
+                }
+
+                if ($path -match "^/public-map/icons/([A-Za-z0-9_\-]+\.(?:webp|png|jpg|svg))$") {
+                    $iconPath = Join-Path $webDir "livemap\icons\$($Matches[1])"
+                    Send-File $context $iconPath
                     continue
                 }
 
@@ -805,6 +822,15 @@ try {
                         Send-Json $context $data
                     } else {
                         Send-Json $context @{ error = "No livemap data" }
+                    }
+                }
+                "/api/pois" {
+                    $poisFile = Join-Path $dataDir "pois.json"
+                    if (Test-Path -LiteralPath $poisFile) {
+                        $data = Get-Content $poisFile -Raw | ConvertFrom-Json
+                        Send-Json $context $data
+                    } else {
+                        Send-Json $context @{ error = "No POI data" }
                     }
                 }
                 "/api/config" {

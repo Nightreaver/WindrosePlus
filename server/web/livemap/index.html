@@ -25,6 +25,52 @@
             width: 8px; height: 8px; border-radius: 50%;
             background: #cc5544; border: 1px solid #aa3322;
         }
+        /* POI markers — one style per `kind` */
+        .poi-base       { width: 16px; height: 16px; border-radius: 50%;
+                          background: #d4a04a; border: 2px solid #ede0cc;
+                          box-shadow: 0 0 6px rgba(212,160,74,0.8); }
+        .poi-marker     { width: 10px; height: 10px; transform: rotate(45deg);
+                          background: #f08040; border: 1px solid #c0501d; }
+        .poi-chest      { width: 9px; height: 9px;
+                          background: #b07030; border: 1px solid #6f4818; }
+        .poi-drop       { width: 4px; height: 4px; border-radius: 50%;
+                          background: #888; opacity: 0.55; }
+        .poi-interacted { width: 7px; height: 7px; border-radius: 50%;
+                          background: #9d6dd1; border: 1px solid #5b3a82; }
+        .poi-standalone { width: 5px; height: 5px; border-radius: 50%;
+                          background: #d8c485; opacity: 0.85; }
+        .poi-spawn      { width: 9px; height: 9px;
+                          background: #4dbf6e; border: 1px solid #2a7a44;
+                          border-radius: 50%; }
+        .poi-player-last{ width: 8px; height: 8px; border-radius: 50%;
+                          background: #5a96d8; border: 1px solid #2c5d99; }
+        .poi-overlap    { width: 9px; height: 9px; border-radius: 50%;
+                          background: transparent; border: 2px solid #54c8d8; }
+        .poi-audio      { width: 9px; height: 9px; border-radius: 50%;
+                          background: transparent; border: 2px solid #d854b8; }
+        .poi-base-label { white-space: nowrap; font-size: 10px;
+                          font-weight: 600; color: #ede0cc;
+                          text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+                          font-family: 'IBM Plex Mono', monospace;
+                          margin-top: 18px; }
+        .poi-user-label { white-space: nowrap; font-size: 10px;
+                          color: #f08040;
+                          text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+                          font-family: 'IBM Plex Mono', monospace;
+                          margin-top: 12px; }
+        .leaflet-control-layers {
+            background: rgba(20, 35, 65, 0.92) !important;
+            color: #ede0cc !important;
+            border: 1px solid rgba(180,140,80,0.3) !important;
+            font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+        }
+        .leaflet-control-layers label { color: #ede0cc; }
+        .poi-icon-img {
+            width: 28px; height: 28px;
+            filter: drop-shadow(0 1px 3px rgba(0,0,0,0.85));
+        }
+        .poi-icon-img-base { width: 36px; height: 36px; }
+        .poi-icon-img-small { width: 22px; height: 22px; opacity: 0.85; }
         #loading {
             position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
             color: #c9a959; font-family: 'IBM Plex Mono', monospace; font-size: 14px;
@@ -130,6 +176,36 @@
             var playerLayer = L.layerGroup().addTo(map);
             var mobLayer = L.layerGroup().addTo(map);
 
+            // POI layers — one per `kind`. Drops are off by default
+            // (lots of clutter); high-value layers (bases / markers /
+            // chests / camps) are on.
+            var poiLayers = {
+                'Bases':         L.layerGroup().addTo(map),
+                'User markers':  L.layerGroup().addTo(map),
+                'Chests':        L.layerGroup().addTo(map),
+                'Camps':         L.layerGroup().addTo(map),
+                'Visited POIs':  L.layerGroup().addTo(map),
+                'Standalone':    L.layerGroup(),
+                'Last positions':L.layerGroup().addTo(map),
+                'POI volumes':   L.layerGroup(),
+                'Audio volumes': L.layerGroup(),
+                'Drops':         L.layerGroup()
+            };
+            // Map kind -> {layer, cssClass, popupName}
+            var poiKinds = {
+                'base':                 { layer: poiLayers['Bases'],         css: 'poi-base',       label: true },
+                'marker':               { layer: poiLayers['User markers'],  css: 'poi-marker',     label: true },
+                'chest':                { layer: poiLayers['Chests'],        css: 'poi-chest' },
+                'drop':                 { layer: poiLayers['Drops'],         css: 'poi-drop' },
+                'interacted_poi':       { layer: poiLayers['Visited POIs'],  css: 'poi-interacted' },
+                'standalone':           { layer: poiLayers['Standalone'],    css: 'poi-standalone' },
+                'spawnpoint':           { layer: poiLayers['Camps'],         css: 'poi-spawn' },
+                'player_last_position': { layer: poiLayers['Last positions'],css: 'poi-player-last' },
+                'overlap':              { layer: poiLayers['POI volumes'],   css: 'poi-overlap' },
+                'audio':                { layer: poiLayers['Audio volumes'], css: 'poi-audio' }
+            };
+            L.control.layers(null, poiLayers, { collapsed: false, position: 'topright' }).addTo(map);
+
             function worldToLatLng(wx, wy) { return L.latLng(wy, wx); }
 
             function escHtml(s) {
@@ -175,8 +251,156 @@
                 } catch (e) {}
             }
 
+            // Resolve a POI to one of the icon files in /livemap/icons/.
+            // Substring-matched against class -> tag -> label fields, with
+            // a kind-based fallback. Returns null when nothing matches —
+            // caller draws the simpler CSS dot in that case.
+            function pickIcon(p) {
+                var c = (p.class || '').toLowerCase();
+                var l = (p.label || '').toLowerCase();
+                var t = (p.tag || '').toLowerCase();
+                var loot = (p.meta && p.meta.loot_table || '').toLowerCase();
+
+                // Class-name matches (most specific first)
+                if (c.indexOf('respawntent') !== -1)                          return 'T_RespawnTent_01.webp';
+                if (c.indexOf('smuggler') !== -1)                             return 'T_MapIcon_Smugglers.webp';
+                if (c.indexOf('bucanee') !== -1 || c.indexOf('buccanee') !== -1) return 'T_MapIcon_Buccaneers.webp';
+                if (c.indexOf('brethren') !== -1)                             return 'T_MapIcon_Brethren.webp';
+                if (c.indexOf('blackbeard') !== -1)                           return 'T_MapIcon_BlackBeard.webp';
+                if (c.indexOf('civilian') !== -1)                             return 'T_MapIcon_Civilians.webp';
+                if (c.indexOf('corrupted') !== -1)                            return 'T_MapIcon_Corrupted.webp';
+                if (c.indexOf('outpost') !== -1)                              return 'T_MapIcon_Outpost_01.webp';
+                if (c.indexOf('table') !== -1)                                return 'T_MapIcon_Table.webp';
+                if (c.indexOf('altar') !== -1)                                return 'T_MapIcon_Altar_02.webp';
+                if (c.indexOf('panno') !== -1)                                return 'T_MapIcon_PannoRuins.webp';
+                if (c.indexOf('stargazer') !== -1)                            return 'T_MapIcon_StargazerTower.webp';
+                if (c.indexOf('firebowl') !== -1)                             return 'T_MapIcon_Firebowl.webp';
+                if (c.indexOf('pool') !== -1)                                 return 'T_MapIcon_Pool.webp';
+                if (c.indexOf('undead') !== -1)                               return 'T_MapIcon_Undeads.webp';
+                if (c.indexOf('dungeon') !== -1)                              return 'T_MapIcon_Dungeon_03.webp';
+                if (c.indexOf('shipwreck') !== -1)                            return 'T_IconPOI_Shipwreck.webp';
+                if (c.indexOf('ship') !== -1)                                 return 'T_MapIcon_Ship.webp';
+                if (c.indexOf('cave') !== -1)                                 return 'T_IconPOI_Cave.webp';
+                if (c.indexOf('boss') !== -1)                                 return 'T_IconPOI_BossArena.webp';
+                if (c.indexOf('quest') !== -1)                                return 'T_IconPOI_Quest.webp';
+                if (c.indexOf('mystery') !== -1)                              return 'T_IconPOI_Mystery.webp';
+                if (c.indexOf('fort') !== -1)                                 return 'T_IconPOI_Fort.webp';
+                if (c.indexOf('ruin') !== -1)                                 return 'T_MapIcon_Ruins_02.webp';
+                if (c.indexOf('mineral') !== -1 || c.indexOf('mine') !== -1)  return 'T_MapIcon_Mine.webp';
+                if (c.indexOf('hut') !== -1)                                  return 'T_MapIcon_Hut_02.webp';
+                if (c.indexOf('coastalcamp') !== -1 || c.indexOf('coastal_camp') !== -1) return 'T_IconPOI_CoastalCamp.webp';
+                if (c.indexOf('camp_smuggler') !== -1 || c.indexOf('smuggler_camp') !== -1) return 'T_IconPOI_Camp_Smuggler.webp';
+                if (c.indexOf('farm') !== -1 || c.indexOf('garden') !== -1 || c.indexOf('crop') !== -1 || c.indexOf('seedbed') !== -1) return 'T_IconPOI_Farm.webp';
+
+                // Chest classification by tag / loot table reference
+                if (p.kind === 'chest') {
+                    if (loot.indexOf('smuggler') !== -1)  return 'T_MapIcon_Smugglers.webp';
+                    if (loot.indexOf('bucanee') !== -1 || loot.indexOf('buccanee') !== -1) return 'T_MapIcon_Buccaneers.webp';
+                    if (loot.indexOf('brethren') !== -1)  return 'T_MapIcon_Brethren.webp';
+                    if (loot.indexOf('blackbeard') !== -1) return 'T_MapIcon_BlackBeard.webp';
+                    if (loot.indexOf('civilian') !== -1)  return 'T_MapIcon_Civilians.webp';
+                    if (loot.indexOf('treasure') !== -1)  return 'T_IconPOI_Mystery.webp';
+                    if (t.indexOf('treasure') !== -1)     return 'T_IconPOI_Mystery.webp';
+                    return 'T_IconPOI_Mystery.webp';
+                }
+
+                // User-marker label hints
+                if (p.kind === 'marker') {
+                    if (l.indexOf('mine') !== -1 || l.indexOf('mining') !== -1 ||
+                        l.indexOf('kupfer') !== -1 || l.indexOf('iron') !== -1 ||
+                        l.indexOf('copper') !== -1 || l.indexOf('sulfur') !== -1 ||
+                        l.indexOf('sulf') !== -1) return 'T_MapIcon_Mine.webp';
+                    if (l.indexOf('home') !== -1) return 'T_MapIcon_Hut_02.webp';
+                    if (l.indexOf('camp') !== -1) return 'T_IconPOI_CoastalCamp.webp';
+                    if (l.indexOf('quest') !== -1) return 'T_IconPOI_Quest.webp';
+                    if (l.indexOf('farm') !== -1) return 'T_IconPOI_Farm.webp';
+                    if (l.indexOf('cave') !== -1) return 'T_IconPOI_Cave.webp';
+                    if (l.indexOf('fort') !== -1) return 'T_IconPOI_Fort.webp';
+                    if (l.indexOf('ship') !== -1) return 'T_MapIcon_Ship.webp';
+                    if (l.indexOf('ruin') !== -1) return 'T_MapIcon_Ruins_02.webp';
+                }
+
+                // Kind-default
+                if (p.kind === 'base')                   return 'T_MapIcon_Hut_02.webp';
+                if (p.kind === 'spawnpoint')             return 'T_RespawnTent_01.webp';
+
+                return null;
+            }
+
+            var ICON_PREFIX = isPublicMap ? '/public-map/icons/' : '/livemap/icons/';
+            function iconUrl(name) { return withPublicToken(ICON_PREFIX + name); }
+
+            async function fetchPois() {
+                try {
+                    var poisUrl = isPublicMap ? '/api/public/pois' : '/api/pois';
+                    var res = await fetch(withPublicToken(poisUrl));
+                    if (!res.ok) return;
+                    var data = await res.json();
+                    if (!data || !Array.isArray(data.pois)) return;
+
+                    Object.values(poiLayers).forEach(function (l) { l.clearLayers(); });
+
+                    data.pois.forEach(function (p) {
+                        // Skip rows with no world coords (mineral_node /
+                        // foliage / static_actor only have local-island
+                        // coords — no world transform available client-side).
+                        if (typeof p.x !== 'number' || typeof p.y !== 'number') return;
+                        if (Math.abs(p.x) < 100 && Math.abs(p.y) < 100) return;
+
+                        var spec = poiKinds[p.kind];
+                        if (!spec) return;
+
+                        var labelHtml = '';
+                        if (spec.label) {
+                            var text = p.label || (p.meta && p.meta.block_count ?
+                                (p.kind === 'base' ? p.meta.block_count + ' blocks' : '') : '');
+                            if (text) {
+                                var labelClass = (p.kind === 'base') ? 'poi-base-label' : 'poi-user-label';
+                                labelHtml = '<div class="' + labelClass + '">' + escHtml(text) + '</div>';
+                            }
+                        }
+
+                        var iconFile = pickIcon(p);
+                        var html, iconSize;
+                        if (iconFile) {
+                            // Game icon, sized by importance
+                            var imgClass = (p.kind === 'base')
+                                ? 'poi-icon-img poi-icon-img-base'
+                                : (p.kind === 'drop' || p.kind === 'standalone' || p.kind === 'interacted_poi')
+                                    ? 'poi-icon-img poi-icon-img-small'
+                                    : 'poi-icon-img';
+                            html = '<img class="' + imgClass + '" src="' + iconUrl(iconFile) + '" alt="">' + labelHtml;
+                            iconSize = (p.kind === 'base') ? 36
+                                     : (p.kind === 'drop' || p.kind === 'standalone' || p.kind === 'interacted_poi') ? 22
+                                     : 28;
+                        } else {
+                            // Fallback CSS dot for kinds without a matching icon
+                            html = '<div class="' + spec.css + '"></div>' + labelHtml;
+                            iconSize = (p.kind === 'base') ? 16
+                                     : (p.kind === 'drop' || p.kind === 'standalone') ? 5 : 10;
+                        }
+
+                        var icon = L.divIcon({
+                            className: '',
+                            html: html,
+                            iconSize: [iconSize, iconSize],
+                            iconAnchor: [iconSize / 2, iconSize / 2]
+                        });
+
+                        var tooltip = p.kind + (p.label ? ': ' + p.label : '') +
+                                      (p.class ? ' (' + p.class + ')' : '');
+                        L.marker(worldToLatLng(p.x, p.y), { icon: icon, title: tooltip })
+                            .addTo(spec.layer);
+                    });
+                } catch (e) {}
+            }
+
             fetchEntities();
             setInterval(fetchEntities, 5000);
+            fetchPois();
+            // POIs include user markers / bases / drops / player_last_position,
+            // which all change. Refresh on a slower cadence than entities.
+            setInterval(fetchPois, 30000);
         })();
     </script>
 </body>
