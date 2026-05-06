@@ -94,6 +94,24 @@ if (Test-Path -LiteralPath $iniParserPath) {
     Write-Host "WARN: IniConfigParser.ps1 not found at $iniParserPath. /api/pak-status CT detection degraded."
 }
 
+# Layout-fingerprint scanner. Used by /api/layout to surface the world's
+# layoutFingerprint, seed, worldPreset, and terrainPlacements.
+$script:LayoutScannerLoaded = $false
+$script:LayoutScannerLoadError = $null
+$layoutScannerPath = Join-Path $PSScriptRoot "lib\Get-LayoutFingerprint.ps1"
+if (Test-Path -LiteralPath $layoutScannerPath) {
+    try {
+        . $layoutScannerPath
+        $script:LayoutScannerLoaded = $true
+    } catch {
+        $script:LayoutScannerLoadError = $_.Exception.Message
+        Write-Host "WARN: Get-LayoutFingerprint.ps1 failed to load: $($_.Exception.Message). /api/layout unavailable."
+    }
+} else {
+    $script:LayoutScannerLoadError = "File not found: $layoutScannerPath"
+    Write-Host "WARN: Get-LayoutFingerprint.ps1 not found at $layoutScannerPath. /api/layout unavailable."
+}
+
 # Re-read the RCON password on every auth attempt instead of caching it at startup.
 # External writers (e.g. an orchestration panel) can overwrite windrose_plus.json
 # mid-session, and non-atomic writes can produce transient parse failures.
@@ -326,7 +344,7 @@ Register-ObjectEvent $tileGenTimer Elapsed -Action {
                     state = "running"
                     ts = $started
                     script = $tileGenScript
-                } | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+                } | ConvertTo-Json -Depth 100 -Compress), [System.Text.UTF8Encoding]::new($false))
                 $output = (& $tileGenScript -GameDir $gameDir 2>&1 | Out-String).Trim()
                 [System.IO.File]::WriteAllText($tileGenStatus, (@{
                     state = "complete"
@@ -334,7 +352,7 @@ Register-ObjectEvent $tileGenTimer Elapsed -Action {
                     started_ts = $started
                     script = $tileGenScript
                     output = $output
-                } | ConvertTo-Json -Depth 4 -Compress), [System.Text.UTF8Encoding]::new($false))
+                } | ConvertTo-Json -Depth 100 -Compress), [System.Text.UTF8Encoding]::new($false))
                 Write-Host "Map tiles generated."
             } catch {
                 $msg = $_.Exception.Message
@@ -343,7 +361,7 @@ Register-ObjectEvent $tileGenTimer Elapsed -Action {
                     ts = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
                     script = $tileGenScript
                     error = $msg
-                } | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+                } | ConvertTo-Json -Depth 100 -Compress), [System.Text.UTF8Encoding]::new($false))
                 Write-Host "Tile generation failed: $msg"
             }
         } else {
@@ -352,7 +370,7 @@ Register-ObjectEvent $tileGenTimer Elapsed -Action {
                 ts = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
                 script = $tileGenScript
                 error = "generateTiles.ps1 not found"
-            } | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+            } | ConvertTo-Json -Depth 100 -Compress), [System.Text.UTF8Encoding]::new($false))
         }
     }
 } | Out-Null
@@ -398,7 +416,7 @@ Register-ObjectEvent $dashRestartTimer Elapsed -Action {
 $dashRestartTimer.Start()
 
 function Send-Json($context, $data, $statusCode = 200) {
-    $json = if ($null -eq $data) { '{}' } else { $data | ConvertTo-Json -Depth 10 -Compress }
+    $json = if ($null -eq $data) { '{}' } else { $data | ConvertTo-Json -Depth 100 -Compress }
     if ([string]::IsNullOrEmpty($json)) { $json = '{}' }
     $buffer = [System.Text.Encoding]::UTF8.GetBytes($json)
     $context.Response.StatusCode = $statusCode
@@ -411,7 +429,7 @@ function Send-Json($context, $data, $statusCode = 200) {
 
 function Write-AtomicUtf8Json($path, $data) {
     $tmpPath = "$path.tmp"
-    $json = $data | ConvertTo-Json -Depth 10 -Compress
+    $json = $data | ConvertTo-Json -Depth 100 -Compress
     [System.IO.File]::WriteAllText($tmpPath, $json, [System.Text.UTF8Encoding]::new($false))
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
@@ -509,6 +527,232 @@ function Get-TerrainHeightAt($DataDir, [double]$WorldX, [double]$WorldY) {
     return $null
 }
 
+# --- Layout fingerprint discovery + cache ---
+# Find the leaf folder directly containing the most .sst files (the active
+# RocksDB world dir). Walks SaveProfiles recursively because the path layout
+# varies by Windrose version (e.g. <profile>\Worlds\<id>\RocksDB\0.10.0\Players).
+function Find-ActiveWorldFolder {
+    $saveRoot = Join-Path $gameDir "R5\Saved\SaveProfiles"
+    if (-not (Test-Path -LiteralPath $saveRoot)) { return $null }
+
+    $byDir = @{}
+    Get-ChildItem -LiteralPath $saveRoot -Recurse -Filter '*.sst' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $d = $_.DirectoryName
+        if ($byDir.ContainsKey($d)) { $byDir[$d] = $byDir[$d] + 1 } else { $byDir[$d] = 1 }
+    }
+    if ($byDir.Count -eq 0) { return $null }
+
+    $best = $byDir.GetEnumerator() | Sort-Object -Property Value -Descending | Select-Object -First 1
+    return $best.Key
+}
+
+# Fast manifest hash that captures only file names + mtimes, used to invalidate
+# the cached layout scan when RocksDB compaction changes the .sst file set.
+function Get-LayoutCacheKey($worldFolder) {
+    if (-not $worldFolder -or -not (Test-Path -LiteralPath $worldFolder)) { return $null }
+    $entries = Get-ChildItem -LiteralPath $worldFolder -Recurse -Filter '*.sst' -ErrorAction SilentlyContinue -File |
+        Sort-Object FullName |
+        ForEach-Object { "{0}|{1}|{2}" -f $_.Name, $_.Length, $_.LastWriteTimeUtc.Ticks }
+    if (-not $entries) { return $null }
+    $joined = ($entries -join "`n")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($joined))
+        return -join ($bytes | ForEach-Object { $_.ToString('x2') })
+    } finally { $sha.Dispose() }
+}
+
+# Strip Windows-style absolute paths from any string before it crosses the
+# unauthenticated /api/layout boundary. Used on every error message that may
+# include $layoutScannerPath, $worldFolder, scanner exceptions, etc. The
+# regex matches drive-letter paths with no path-separator backslash escaped:
+# in a PowerShell single-quoted string, '\\' is a literal two-char backslash
+# pair, which becomes a single '\' in the .NET regex (which matches one '\').
+function Sanitize-PathInMessage([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return $s }
+    return [regex]::Replace($s, '[A-Za-z]:\\[^\s,;)\]"]*', '<path>')
+}
+
+function Get-PublicScanView($scan) {
+    if (-not $scan) { return $null }
+    return [pscustomobject]@{
+        layoutFingerprint      = $scan.layoutFingerprint
+        shortLayoutFingerprint = $scan.shortLayoutFingerprint
+        seed                   = $scan.seed
+        worldPreset            = $scan.worldPreset
+        terrainPlacements      = $scan.terrainPlacements
+        sstFileCount           = $scan.sstFileCount
+    }
+}
+
+function Get-CachedLayoutScan {
+    $worldFolder = Find-ActiveWorldFolder
+    if (-not $worldFolder) {
+        return @{ ok = $false; error = "No SaveProfiles world folder with .sst files found yet. Join the server once so it writes a save." }
+    }
+
+    $cacheKey = Get-LayoutCacheKey $worldFolder
+    if (-not $cacheKey) {
+        return @{ ok = $false; error = "World folder has no .sst files yet. Join the server once so it writes a save." }
+    }
+
+    $cachePath = Join-Path $dataDir "layout_scan.json"
+    if (Test-Path -LiteralPath $cachePath) {
+        try {
+            $cached = Get-Content -LiteralPath $cachePath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($cached.cacheKey -eq $cacheKey -and $cached.scan) {
+                return @{ ok = $true; cached = $true; scan = $cached.scan; cachedAt = $cached.cachedAt }
+            }
+        } catch {
+            # fall through and re-scan
+        }
+    }
+
+    if (-not $script:LayoutScannerLoaded) {
+        return @{ ok = $false; error = "Layout scanner not loaded: " + (Sanitize-PathInMessage $script:LayoutScannerLoadError) }
+    }
+
+    try {
+        $scan = Get-WindroseLayoutScan -Path $worldFolder
+    } catch {
+        # sanitize: scanner errors may include the on-disk path
+        return @{ ok = $false; error = "Scanner failed: " + (Sanitize-PathInMessage $_.Exception.Message) }
+    }
+
+    $now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $envelope = [pscustomobject]@{
+        cacheKey = $cacheKey
+        cachedAt = $now
+        scan     = $scan
+    }
+    try {
+        Write-AtomicUtf8Json $cachePath $envelope
+    } catch {
+        Write-Host "WARN: failed to write layout_scan.json cache: $($_.Exception.Message)"
+    }
+    return @{ ok = $true; cached = $false; scan = $scan; cachedAt = $now }
+}
+
+# POST the local scan to windrose.tools so they index it, then GET the runtime
+# overlay (markers, biome polygons, manual POIs, quest popups). Cached locally
+# keyed off layoutFingerprint so we only hit the upstream once per world layout.
+function Get-CachedLayoutRuntime($scan) {
+    if (-not $scan -or -not $scan.layoutFingerprint) {
+        return @{ ok = $false; error = "Scanner result missing layoutFingerprint" }
+    }
+    $fp = [string]$scan.layoutFingerprint
+    $runtimeCachePath = Join-Path $dataDir "layout_runtime.json"
+
+    if (Test-Path -LiteralPath $runtimeCachePath) {
+        try {
+            $cached = Get-Content -LiteralPath $runtimeCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($cached.layoutFingerprint -eq $fp -and $cached.runtime) {
+                return @{ ok = $true; cached = $true; runtime = $cached.runtime; fetchedAt = $cached.fetchedAt }
+            }
+        } catch {
+            # fall through and re-fetch
+        }
+    }
+
+    $runtime = $null
+    $fetchedFrom = $null
+    $shouldPost = $false
+    try {
+        $resp = Invoke-WebRequest -Uri ("https://windrose.tools/api/map/runtime?layout={0}" -f $fp) `
+            -Method Get -TimeoutSec 25 -UseBasicParsing -ErrorAction Stop
+        if ($resp.StatusCode -eq 200 -and $resp.Content) {
+            $runtime = $resp.Content | ConvertFrom-Json
+            $fetchedFrom = "GET"
+        }
+    } catch {
+        # 4xx = upstream rejected our query for this fingerprint (404 not found,
+        # 400 bad-request, etc.) — POST our scan to seed it.
+        # 5xx / 429 / network timeout = upstream is degraded — fall through to
+        # stale cache rather than amplifying load.
+        $statusCode = 0
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($statusCode -ge 400 -and $statusCode -lt 500) { $shouldPost = $true }
+        else {
+            # serve stale cache if we have any
+            if (Test-Path -LiteralPath $runtimeCachePath) {
+                try {
+                    $stale = Get-Content -LiteralPath $runtimeCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
+                    if ($stale.runtime -and $stale.layoutFingerprint -eq $fp) {
+                        return @{ ok = $true; cached = $true; stale = $true; runtime = $stale.runtime; fetchedAt = $stale.fetchedAt; fetchedFrom = "stale-on-upstream-fail" }
+                    }
+                } catch {}
+            }
+            return @{ ok = $false; error = "windrose.tools GET failed (HTTP $statusCode); no stale cache available" }
+        }
+    }
+
+    if (-not $runtime -and $shouldPost) {
+        try {
+            $body = ([pscustomobject]@{
+                layoutFingerprint = $fp
+                seed              = $scan.seed
+                worldPreset       = $scan.worldPreset
+                terrainPlacements = $scan.terrainPlacements
+            }) | ConvertTo-Json -Depth 10 -Compress
+            $resp = Invoke-WebRequest -Uri "https://windrose.tools/api/map/runtime" -Method Post `
+                -Body $body -ContentType "application/json" -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop
+            if ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 201) {
+                if ($resp.Content) {
+                    $runtime = $resp.Content | ConvertFrom-Json
+                } else {
+                    $resp2 = Invoke-WebRequest -Uri ("https://windrose.tools/api/map/runtime?layout={0}" -f $fp) `
+                        -Method Get -TimeoutSec 25 -UseBasicParsing -ErrorAction Stop
+                    if ($resp2.StatusCode -eq 200 -and $resp2.Content) {
+                        $runtime = $resp2.Content | ConvertFrom-Json
+                    }
+                }
+                $fetchedFrom = "POST"
+            }
+        } catch {
+            # POST also failed (5xx / 429 / timeout). Serve stale cache if we
+            # have any, else return a friendly error. This avoids hammering
+            # the upstream with POSTs every poll while it's degraded.
+            if (Test-Path -LiteralPath $runtimeCachePath) {
+                try {
+                    $stale = Get-Content -LiteralPath $runtimeCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
+                    if ($stale.runtime -and $stale.layoutFingerprint -eq $fp) {
+                        return @{ ok = $true; cached = $true; stale = $true; runtime = $stale.runtime; fetchedAt = $stale.fetchedAt; fetchedFrom = "stale-on-post-fail" }
+                    }
+                } catch {}
+            }
+            return @{ ok = $false; error = "windrose.tools POST failed (no stale cache): " + (Sanitize-PathInMessage $_.Exception.Message) }
+        }
+    }
+
+    if (-not $runtime) {
+        # GET 404 + POST returned non-2xx without throwing. Treat same as POST
+        # failure: serve stale if available, else surface no-data.
+        if (Test-Path -LiteralPath $runtimeCachePath) {
+            try {
+                $stale = Get-Content -LiteralPath $runtimeCachePath -Raw -ErrorAction Stop | ConvertFrom-Json
+                if ($stale.runtime) {
+                    return @{ ok = $true; cached = $true; stale = $true; runtime = $stale.runtime; fetchedAt = $stale.fetchedAt; fetchedFrom = "stale-on-no-data" }
+                }
+            } catch {}
+        }
+        return @{ ok = $false; error = "windrose.tools returned no runtime data for fingerprint $fp" }
+    }
+
+    $now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $envelope = [pscustomobject]@{
+        layoutFingerprint = $fp
+        fetchedAt         = $now
+        fetchedFrom       = $fetchedFrom
+        runtime           = $runtime
+    }
+    try {
+        Write-AtomicUtf8Json $runtimeCachePath $envelope
+    } catch {
+        Write-Host "WARN: failed to write layout_runtime.json cache: $($_.Exception.Message)"
+    }
+    return @{ ok = $true; cached = $false; runtime = $runtime; fetchedAt = $now; fetchedFrom = $fetchedFrom }
+}
+
 function Get-RconWorkerDiagnostic($spoolDir, $cmdPath) {
     $statusPath = Join-Path $dataDir "rcon_status.json"
     $now = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -571,7 +815,7 @@ function Send-File($context, $filePath) {
     $mimeTypes = @{
         ".html" = "text/html"; ".css" = "text/css"; ".js" = "application/javascript"
         ".json" = "application/json"; ".png" = "image/png"; ".jpg" = "image/jpeg"
-        ".svg" = "image/svg+xml"; ".ico" = "image/x-icon"
+        ".svg" = "image/svg+xml"; ".ico" = "image/x-icon"; ".webp" = "image/webp"
     }
     $mime = if ($mimeTypes[$ext]) { $mimeTypes[$ext] } else { "application/octet-stream" }
     $context.Response.ContentType = $mime
@@ -742,6 +986,69 @@ try {
                 continue
             }
 
+            # Layout fingerprint + windrose.tools runtime overlay — no auth.
+            # Output is identical to what windrose.tools serves publicly for
+            # any matching world layout (no player or server identifying info).
+            if ($path -eq "/api/layout") {
+                $r = Get-CachedLayoutScan
+                if ($r.ok) {
+                    Send-Json $context @{
+                        ok       = $true
+                        cached   = $r.cached
+                        cachedAt = $r.cachedAt
+                        scan     = (Get-PublicScanView $r.scan)
+                    }
+                } else {
+                    Send-Json $context @{ ok = $false; error = $r.error } 503
+                }
+                continue
+            }
+            if ($path -eq "/api/layout/runtime") {
+                $scanResult = Get-CachedLayoutScan
+                if (-not $scanResult.ok) {
+                    Send-Json $context @{ ok = $false; error = $scanResult.error } 503
+                    continue
+                }
+                $runtimeResult = Get-CachedLayoutRuntime $scanResult.scan
+                if ($runtimeResult.ok) {
+                    Send-Json $context @{
+                        ok                = $true
+                        layoutFingerprint = $scanResult.scan.layoutFingerprint
+                        seed              = $scanResult.scan.seed
+                        worldPreset       = $scanResult.scan.worldPreset
+                        cached            = $runtimeResult.cached
+                        stale             = ($runtimeResult.stale -eq $true)
+                        fetchedAt         = $runtimeResult.fetchedAt
+                        fetchedFrom       = $runtimeResult.fetchedFrom
+                        runtime           = $runtimeResult.runtime
+                    }
+                } else {
+                    Send-Json $context @{
+                        ok                = $false
+                        layoutFingerprint = $scanResult.scan.layoutFingerprint
+                        error             = $runtimeResult.error
+                    } 503
+                }
+                continue
+            }
+
+            # Static game-catalog assets (item metadata + icons) — no auth.
+            # This is generic Windrose game data, identical on every server,
+            # no player or server identifying information. Letting public
+            # Sea Chart viewers see the catalog overlay is the whole point.
+            if ($path.StartsWith("/catalog/")) {
+                $catalogRoot = [System.IO.Path]::GetFullPath((Join-Path $webDir "catalog"))
+                $candidate   = [System.IO.Path]::GetFullPath((Join-Path $webDir ($path.TrimStart("/").Replace("/", "\"))))
+                $sep         = [System.IO.Path]::DirectorySeparatorChar
+                if (-not $candidate.StartsWith($catalogRoot + $sep, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $context.Response.StatusCode = 403
+                    $context.Response.Close()
+                    continue
+                }
+                Send-File $context $candidate
+                continue
+            }
+
             # Optional public Sea Chart. This deliberately exposes only the map
             # manifest, livemap snapshot, and generated tiles. Dashboard, RCON,
             # config, repair, status, and terrain-height routes still require
@@ -861,15 +1168,24 @@ try {
                     $wrapper = Join-Path $gameDir "StartWindrosePlusServer.bat"
                     $jsonPath = Join-Path $gameDir "windrose_plus.json"
                     $iniPath  = Join-Path $gameDir "windrose_plus.ini"
-                    $iniPaths = @(
+                    # CurveTable-relevant INIs only — harvest is a
+                    # multipliers-only file and must NOT make ct_config_present
+                    # true on its own (would trigger spurious "Default INI
+                    # missing" status when no CT customization is in play).
+                    $ctIniPaths = @(
                         $iniPath,
                         (Join-Path $gameDir "windrose_plus.weapons.ini"),
                         (Join-Path $gameDir "windrose_plus.food.ini"),
                         (Join-Path $gameDir "windrose_plus.gear.ini"),
                         (Join-Path $gameDir "windrose_plus.entities.ini")
                     )
+                    # Full INI list (CT + multipliers) used for mtime / stale
+                    # detection so harvest edits still invalidate the build.
+                    $iniPaths = $ctIniPaths + @(
+                        (Join-Path $gameDir "windrose_plus.harvest.ini")
+                    )
                     $ctConfigPresent = $false
-                    foreach ($p in $iniPaths) {
+                    foreach ($p in $ctIniPaths) {
                         if (Test-Path -LiteralPath $p) {
                             $ctConfigPresent = $true
                             break
@@ -909,6 +1225,33 @@ try {
                                     }
                                 }
                             } catch { }
+                        }
+                        # windrose_plus.harvest.ini alone (no non-default
+                        # multipliers in the JSON) also requires a Multipliers
+                        # PAK. Inline parse — same `Key = Number` shape that
+                        # Read-HarvestIni handles in MultiplierPakBuilder.ps1.
+                        if (-not $expectMultPak) {
+                            $harvestIniPath = Join-Path $gameDir "windrose_plus.harvest.ini"
+                            if (Test-Path -LiteralPath $harvestIniPath) {
+                                try {
+                                    foreach ($raw in Get-Content -LiteralPath $harvestIniPath) {
+                                        $line = $raw.Trim()
+                                        if (-not $line) { continue }
+                                        $first = $line[0]
+                                        if ($first -eq ';' -or $first -eq '#' -or $first -eq '[') { continue }
+                                        $eq = $line.IndexOf('=')
+                                        if ($eq -lt 1) { continue }
+                                        $val = $line.Substring($eq + 1)
+                                        $semi = $val.IndexOf(';')
+                                        if ($semi -ge 0) { $val = $val.Substring(0, $semi) }
+                                        $val = $val.Trim()
+                                        $d = 0.0
+                                        if ([double]::TryParse($val, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) {
+                                            if ($d -ne 1.0) { $expectMultPak = $true; break }
+                                        }
+                                    }
+                                } catch { }
+                            }
                         }
 
                         if (-not $script:IniParserLoaded) {

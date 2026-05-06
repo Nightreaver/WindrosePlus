@@ -166,6 +166,57 @@ function Test-WindrosePlusPakConflicts {
     return @($conflicts)
 }
 
+# Parse windrose_plus.harvest.ini into a {ResourceName -> multiplier}
+# hashtable. Section headers are ignored; only `Key = Number` lines are
+# read. Inline `;` comments are stripped. Values clamped to >= 0.01.
+# Missing file or no readable values -> empty hashtable.
+function Read-HarvestIni {
+    param([string]$Path)
+    $out = @{}
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $out }
+    foreach ($raw in Get-Content -LiteralPath $Path) {
+        $line = $raw.Trim()
+        if (-not $line) { continue }
+        $first = $line[0]
+        if ($first -eq ';' -or $first -eq '#' -or $first -eq '[') { continue }
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $key = $line.Substring(0, $eq).Trim()
+        $val = $line.Substring($eq + 1)
+        $semi = $val.IndexOf(';')
+        if ($semi -ge 0) { $val = $val.Substring(0, $semi) }
+        $val = $val.Trim()
+        if (-not $val) {
+            Write-Warning "Read-HarvestIni: '$key =' has no value (line skipped)"
+            continue
+        }
+        $d = 0.0
+        if ([double]::TryParse($val, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$d)) {
+            $out[$key] = [Math]::Max(0.01, $d)
+        } else {
+            Write-Warning "Read-HarvestIni: '$key = $val' is not a number (expected e.g. '5.0', not '5x'); line skipped"
+        }
+    }
+    return $out
+}
+
+# Pull the resource family from a UE asset soft-object path. Matches both
+# loot-table item paths (`.../Resource_Wood_T01...`) and the BP_Mineral_*
+# blueprint paths used in ResourceSpawner Assets[]
+# (`/Game/.../BP_Mineral_Clay_T01_C`). Returns $null when nothing matches.
+#
+# Note: the Linux docker installer's sed pass rewrites `\<alnum>` between
+# alnum chars to `/<alnum>` (path-separator fixup for Windows literals),
+# which would mangle regex shorthand like `\d` to `/d`. Use [0-9] instead.
+function Get-ResourceFamily {
+    param([string]$LootItemPath)
+    if (-not $LootItemPath) { return $null }
+    if ($LootItemPath -match '(?:Resource|Mineral)_([A-Za-z][A-Za-z0-9]*)_T[0-9]') {
+        return $Matches[1]
+    }
+    return $null
+}
+
 function Build-MultiplierPak {
     <#
     .SYNOPSIS
@@ -255,7 +306,14 @@ function Build-MultiplierPak {
     $cookSpeed = [Math]::Max(0.01, $cookSpeed)
     $harvestYield = [Math]::Max(0.01, $harvestYield)
 
-    $allDefault = ($loot -eq 1.0 -and $xp -eq 1.0 -and $stackSize -eq 1.0 -and $craftEfficiency -eq 1.0 -and $cropSpeed -eq 1.0 -and $weight -eq 1.0 -and $invSize -eq 1.0 -and $pointsPerLvl -eq 1.0 -and $cookSpeed -eq 1.0 -and $harvestYield -eq 1.0)
+    # Per-resource harvest overrides from windrose_plus.harvest.ini
+    # (optional). Stacks multiplicatively on $harvestYield.
+    $harvestIniPath = if ($ServerDir) { Join-Path $ServerDir "windrose_plus.harvest.ini" } else { $null }
+    $perResource = Read-HarvestIni -Path $harvestIniPath
+    $perResourceActive = $false
+    foreach ($v in $perResource.Values) { if ($v -ne 1.0) { $perResourceActive = $true; break } }
+
+    $allDefault = ($loot -eq 1.0 -and $xp -eq 1.0 -and $stackSize -eq 1.0 -and $craftEfficiency -eq 1.0 -and $cropSpeed -eq 1.0 -and $weight -eq 1.0 -and $invSize -eq 1.0 -and $pointsPerLvl -eq 1.0 -and $cookSpeed -eq 1.0 -and $harvestYield -eq 1.0 -and -not $perResourceActive)
     if ($allDefault) {
         $result.Error = "All multipliers are 1.0 (default). Nothing to build."
         return $result
@@ -313,6 +371,7 @@ function Build-MultiplierPak {
         if ($loot -ne 1.0) {
             Write-Host "  Modifying loot tables (${loot}x)..."
             $lootFiles = Invoke-RepakList -Repak $repak -AesKey $AesKey -PakPath $pak -Filter "LootTable"
+            $lootMod = 0
             foreach ($lf in $lootFiles) {
                 $json = Invoke-RepakGet -Repak $repak -AesKey $AesKey -PakPath $pak -FilePath $lf.Trim()
                 if (-not $json) { continue }
@@ -332,11 +391,15 @@ function Build-MultiplierPak {
                 if ($changed) {
                     $outPath = Join-Path $tmpDir $lf.Trim()
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     $modifiedCount++
+                    $lootMod++
                 }
             }
-            Write-Host "    Modified $modifiedCount loot tables"
+            Write-Host "    Modified $lootMod loot tables"
+            if ($lootMod -eq 0) {
+                Write-Warning "loot=${loot}x configured but zero loot tables matched — LootTable filter or LootData[].Min/Max schema may have been renamed by a recent engine update."
+            }
         }
 
         # XP tables
@@ -346,6 +409,7 @@ function Build-MultiplierPak {
                 "R5/Plugins/R5BusinessRules/Content/EntityProgression/DA_HeroLevels.json",
                 "R5/Plugins/R5BusinessRules/Content/EntityProgression/Ship/DA_ShipLevels.json"
             )
+            $xpMod = 0
             foreach ($xf in $xpFiles) {
                 $json = Invoke-RepakGet -Repak $repak -AesKey $AesKey -PakPath $pak -FilePath $xf
                 if (-not $json) { continue }
@@ -361,10 +425,14 @@ function Build-MultiplierPak {
                 if ($changed) {
                     $outPath = Join-Path $tmpDir $xf
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     $modifiedCount++
+                    $xpMod++
                     Write-Host "    Modified $xf"
                 }
+            }
+            if ($xpMod -eq 0) {
+                Write-Warning "xp=${xp}x configured but zero XP tables matched — DA_HeroLevels / DA_ShipLevels paths or Levels[].Exp schema may have been renamed by a recent engine update."
             }
         }
 
@@ -400,12 +468,15 @@ function Build-MultiplierPak {
                 if ($changed) {
                     $outPath = Join-Path $tmpDir $rf.Trim()
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     $modifiedCount++
                     $recipeMod++
                 }
             }
             Write-Host "    Modified $recipeMod recipes"
+            if ($recipeMod -eq 0) {
+                Write-Warning "craft_efficiency=${craftEfficiency}x configured but zero recipes matched — Recipes/ filter or RecipeCost[].Count schema may have been renamed by a recent engine update."
+            }
         }
 
         # inventory_size patching intentionally disabled (v1.0.14).
@@ -468,10 +539,13 @@ function Build-MultiplierPak {
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
                     $modifiedCount++
                 }
-                [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                 $cookMod++
             }
             Write-Host "    Modified $cookMod recipes"
+            if ($cookMod -eq 0) {
+                Write-Warning "cooking_speed=${cookSpeed}x configured but zero recipes had a CookingProcessDuration to scale — Recipes/ filter or CookingProcessDuration field may have been renamed by a recent engine update."
+            }
         }
 
         # Harvest yield (gatherable resource spawn amounts: berries, ore, wood, etc.)
@@ -479,8 +553,24 @@ function Build-MultiplierPak {
         # plus LootData[].Min/Max in mineral foliage loot tables (copper/iron/etc.
         # nodes are loot-table-driven, not ResourceSpawner-driven). Does not touch
         # RespawnInterval — yield per node, not respawn rate.
-        if ($harvestYield -ne 1.0) {
-            Write-Host "  Modifying harvest yields (${harvestYield}x)..."
+        # Per-resource overrides from windrose_plus.harvest.ini stack multiplicatively.
+        if ($harvestYield -ne 1.0 -or $perResourceActive) {
+            if ($perResourceActive) {
+                $perResStr = ($perResource.GetEnumerator() | Where-Object { $_.Value -ne 1.0 } | ForEach-Object { "$($_.Key)=$($_.Value)x" }) -join ", "
+                Write-Host "  Modifying harvest yields (base=${harvestYield}x; per-resource: $perResStr)..."
+            } else {
+                Write-Host "  Modifying harvest yields (${harvestYield}x)..."
+            }
+
+            # Per-family applied counter — increments each time a non-default
+            # per-resource multiplier is matched against an asset family.
+            # Surfaces typos: a configured `Wod=5.0` produces no matches and
+            # ends up reported as `Wod=0` in the summary line below.
+            $perFamilyApplied = @{}
+            foreach ($k in $perResource.Keys) {
+                if ($perResource[$k] -ne 1.0) { $perFamilyApplied[$k] = 0 }
+            }
+
             $harvFiles = Invoke-RepakList -Repak $repak -AesKey $AesKey -PakPath $pak -Filter "ResourcesSpawners/"
             $harvMod = 0
             foreach ($hf in $harvFiles) {
@@ -493,8 +583,25 @@ function Build-MultiplierPak {
                     if (-not $variant.Collection) { continue }
                     foreach ($entry in $variant.Collection) {
                         if ($null -ne $entry.Amount -and $null -ne $entry.Amount.Min -and $null -ne $entry.Amount.Max) {
-                            $entry.Amount.Min = [Math]::Max(1, [int]($entry.Amount.Min * $harvestYield))
-                            $entry.Amount.Max = [Math]::Max(1, [int]($entry.Amount.Max * $harvestYield))
+                            $resMult = 1.0
+                            # ResourceSpawner entries reference one or more BP
+                            # asset paths via Assets[] (e.g. BP_Mineral_Clay_T01).
+                            # Use the first that yields a family.
+                            $family = $null
+                            if ($entry.Assets) {
+                                foreach ($a in $entry.Assets) {
+                                    $f = Get-ResourceFamily -LootItemPath $a
+                                    if ($f) { $family = $f; break }
+                                }
+                            }
+                            if ($family -and $perResource.ContainsKey($family)) {
+                                $resMult = $perResource[$family]
+                                if ($perFamilyApplied.ContainsKey($family)) { $perFamilyApplied[$family]++ }
+                            }
+                            $eff = $harvestYield * $resMult
+                            if ($eff -eq 1.0) { continue }
+                            $entry.Amount.Min = [Math]::Max(1, [int]($entry.Amount.Min * $eff))
+                            $entry.Amount.Max = [Math]::Max(1, [int]($entry.Amount.Max * $eff))
                             $changed = $true
                         }
                     }
@@ -502,7 +609,7 @@ function Build-MultiplierPak {
                 if ($changed) {
                     $outPath = Join-Path $tmpDir $hf.Trim()
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     $modifiedCount++
                     $harvMod++
                 }
@@ -533,14 +640,22 @@ function Build-MultiplierPak {
                 foreach ($item in $data.LootData) {
                     if ($item.LootItem -and $item.LootItem -like "*/InventoryItems/Equipments/*") { continue }
                     if ($null -ne $item.Min -and $null -ne $item.Max) {
-                        $item.Min = [Math]::Max(1, [int]($item.Min * $harvestYield))
-                        $item.Max = [Math]::Max(1, [int]($item.Max * $harvestYield))
+                        $resMult = 1.0
+                        $family = Get-ResourceFamily -LootItemPath $item.LootItem
+                        if ($family -and $perResource.ContainsKey($family)) {
+                            $resMult = $perResource[$family]
+                            if ($perFamilyApplied.ContainsKey($family)) { $perFamilyApplied[$family]++ }
+                        }
+                        $eff = $harvestYield * $resMult
+                        if ($eff -eq 1.0) { continue }
+                        $item.Min = [Math]::Max(1, [int]($item.Min * $eff))
+                        $item.Max = [Math]::Max(1, [int]($item.Max * $eff))
                         $changed = $true
                     }
                 }
                 if ($changed) {
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     if (-not $existedBefore) { $modifiedCount++ }
                     $foliageMod++
                 }
@@ -550,8 +665,9 @@ function Build-MultiplierPak {
             # Pickup-resource loot tables (LootTables/PickupResource/*.json):
             # sulfur pickup chests, salt rocks, mushrooms, shells, dodo eggs,
             # etc. Same LootData[].Min/Max schema as foliage. The loot pass
-            # already scaled these by loot multiplier; stack harvest_yield on
-            # top by reading the working file from tmpDir if present.
+            # already scaled these by loot multiplier; stack harvest_yield
+            # (and any per-resource override) on top by reading the working
+            # file from tmpDir if present.
             $pickupFiles = Invoke-RepakList -Repak $repak -AesKey $AesKey -PakPath $pak -Filter "LootTables/PickupResource/"
             $pickupMod = 0
             foreach ($pf in $pickupFiles) {
@@ -570,14 +686,22 @@ function Build-MultiplierPak {
                 foreach ($item in $data.LootData) {
                     if ($item.LootItem -and $item.LootItem -like "*/InventoryItems/Equipments/*") { continue }
                     if ($null -ne $item.Min -and $null -ne $item.Max) {
-                        $item.Min = [Math]::Max(1, [int]($item.Min * $harvestYield))
-                        $item.Max = [Math]::Max(1, [int]($item.Max * $harvestYield))
+                        $resMult = 1.0
+                        $family = Get-ResourceFamily -LootItemPath $item.LootItem
+                        if ($family -and $perResource.ContainsKey($family)) {
+                            $resMult = $perResource[$family]
+                            if ($perFamilyApplied.ContainsKey($family)) { $perFamilyApplied[$family]++ }
+                        }
+                        $eff = $harvestYield * $resMult
+                        if ($eff -eq 1.0) { continue }
+                        $item.Min = [Math]::Max(1, [int]($item.Min * $eff))
+                        $item.Max = [Math]::Max(1, [int]($item.Max * $eff))
                         $changed = $true
                     }
                 }
                 if ($changed) {
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     if (-not $existedBefore) { $modifiedCount++ }
                     $pickupMod++
                 }
@@ -585,14 +709,23 @@ function Build-MultiplierPak {
             if ($pickupMod -gt 0) { Write-Host "    Modified $pickupMod pickup resource loot tables" }
 
             # Segmented trees and cave dig volumes use contextual destroy
-            # scores instead of the LootData tables above.
+            # scores instead of the LootData tables above. Each file maps
+            # to a single resource family for the per-resource multiplier;
+            # `null` family means "use harvest_yield only".
             $contextualHarvestFiles = @(
-                "R5/Content/Gameplay/ContextualSpawners/DA_ContextualSpawnerParams_Player_SegmentTreesAndMineralDestroy.json",
-                "R5/Content/Gameplay/ContextualSpawners/DA_ContextualSpawnerParams_Player_CopperCaves_DigVolumesDestroy.json",
-                "R5/Content/Gameplay/ContextualSpawners/DA_ContextualSpawnerParams_Player_IronCaverns_DigVolumesDestroy.json"
+                @{ Path = "R5/Content/Gameplay/ContextualSpawners/DA_ContextualSpawnerParams_Player_SegmentTreesAndMineralDestroy.json"; Family = "Wood" },
+                @{ Path = "R5/Content/Gameplay/ContextualSpawners/DA_ContextualSpawnerParams_Player_CopperCaves_DigVolumesDestroy.json"; Family = "CopperOre" },
+                @{ Path = "R5/Content/Gameplay/ContextualSpawners/DA_ContextualSpawnerParams_Player_IronCaverns_DigVolumesDestroy.json"; Family = "Iron" }
             )
             $contextualMod = 0
-            foreach ($cf in $contextualHarvestFiles) {
+            foreach ($cfEntry in $contextualHarvestFiles) {
+                $cf = $cfEntry.Path
+                $cfResMult = 1.0
+                if ($cfEntry.Family -and $perResource.ContainsKey($cfEntry.Family)) {
+                    $cfResMult = $perResource[$cfEntry.Family]
+                }
+                $cfEff = $harvestYield * $cfResMult
+                if ($cfEff -eq 1.0) { continue }
                 $outPath = Join-Path $tmpDir $cf
                 $existedBefore = Test-Path -LiteralPath $outPath
                 if ($existedBefore) {
@@ -605,28 +738,59 @@ function Build-MultiplierPak {
                 if (-not $data.EventHandlers) { continue }
                 $changed = $false
                 if ($null -ne $data.MaxScore) {
-                    $data.MaxScore = [Math]::Max(0.0, [Math]::Round(([double]$data.MaxScore) * $harvestYield, 4))
+                    $data.MaxScore = [Math]::Max(0.0, [Math]::Round(([double]$data.MaxScore) * $cfEff, 4))
                     $changed = $true
                 }
                 foreach ($handler in $data.EventHandlers) {
                     if ($null -ne $handler.Score -and $null -ne $handler.Score.Min -and $null -ne $handler.Score.Max) {
-                        $handler.Score.Min = [Math]::Max(0.0, [Math]::Round(([double]$handler.Score.Min) * $harvestYield, 4))
-                        $handler.Score.Max = [Math]::Max(0.0, [Math]::Round(([double]$handler.Score.Max) * $harvestYield, 4))
+                        $handler.Score.Min = [Math]::Max(0.0, [Math]::Round(([double]$handler.Score.Min) * $cfEff, 4))
+                        $handler.Score.Max = [Math]::Max(0.0, [Math]::Round(([double]$handler.Score.Max) * $cfEff, 4))
                         $changed = $true
                     }
                 }
                 if ($changed) {
+                    # Only credit the per-resource family AFTER a real patch landed.
+                    # Pre-incrementing on entry suppressed the unmatched-keys warning
+                    # when an engine update moved the contextual path or schema.
+                    if ($cfEntry.Family -and $perFamilyApplied.ContainsKey($cfEntry.Family)) {
+                        $perFamilyApplied[$cfEntry.Family]++
+                    }
                     New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
-                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 10), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::WriteAllText($outPath, ($data | ConvertTo-Json -Depth 100), [System.Text.UTF8Encoding]::new($false))
                     if (-not $existedBefore) { $modifiedCount++ }
                     $contextualMod++
                 }
             }
             if ($contextualMod -gt 0) { Write-Host "    Modified $contextualMod contextual destroy score tables" }
+
+            if ($perResourceActive) {
+                $report = ($perFamilyApplied.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ", "
+                Write-Host "    Per-resource matches: $report"
+                $unmatched = @($perFamilyApplied.GetEnumerator() | Where-Object { $_.Value -eq 0 } | ForEach-Object { $_.Key })
+                if ($unmatched.Count -gt 0) {
+                    Write-Warning "Per-resource keys with zero matches (typo or unsupported family?): $($unmatched -join ', ')"
+                }
+            }
+
+            # If a base harvest_yield multiplier was requested but every harvest pass
+            # came back empty, that's an engine-rename signature (ResourcesSpawners/,
+            # LootTables/Foliage/, LootTables/PickupResource/, ContextualSpawners/
+            # paths or their inner schemas changed). Per-resource-only configs with
+            # all-zero matches already surface via the unmatched-keys warning above.
+            if ($harvestYield -ne 1.0 -and ($harvMod + $foliageMod + $pickupMod + $contextualMod) -eq 0) {
+                Write-Warning "harvest_yield=${harvestYield}x configured but zero harvest files matched across resource spawners, foliage loot, pickup loot, and contextual destroy scores — one or more harvest paths/schemas may have been renamed by a recent engine update."
+            }
         }
 
         if ($modifiedCount -eq 0) {
-            if ($effectiveNonDefaultMultipliers -eq 0) {
+            # Only treat zero-modifications as a clean no-op when there was
+            # nothing to apply in the first place. A per-resource-only config
+            # (harvestYield=1.0, Wood=5.0 in harvest.ini) has
+            # effectiveNonDefaultMultipliers=0, so without the perResourceActive
+            # check below, an engine-renamed harvest path or schema would mask
+            # itself as "no work to do" and return success. With it, the build
+            # raises "No files were modified" and the caller can act.
+            if ($effectiveNonDefaultMultipliers -eq 0 -and -not $perResourceActive) {
                 Write-Host "  No active multiplier files were modified; removing stale $outPakPath if present"
                 if (Test-Path -LiteralPath $outPakPath) {
                     Remove-Item -LiteralPath $outPakPath -Force

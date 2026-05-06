@@ -92,12 +92,20 @@ if ($ConfigPath) {
 }
 $iniDir = Split-Path -Parent $iniPath
 if (-not $iniDir) { $iniDir = $ServerDir }
-$iniConfigPaths = @(
+# CurveTable-relevant INIs (drive ct_config_present + parser load).
+# Harvest is a multipliers-only feature; keep it out of this set so a
+# harvest-only INI doesn't trigger CT parsing or "Default INI missing".
+$ctIniConfigPaths = @(
     $iniPath,
     (Join-Path $iniDir "windrose_plus.weapons.ini"),
     (Join-Path $iniDir "windrose_plus.food.ini"),
     (Join-Path $iniDir "windrose_plus.gear.ini"),
     (Join-Path $iniDir "windrose_plus.entities.ini")
+)
+# Full list (CT + multipliers) used for build-input hashing so any INI
+# edit invalidates the cache.
+$iniConfigPaths = $ctIniConfigPaths + @(
+    (Join-Path $iniDir "windrose_plus.harvest.ini")
 )
 if (-not $DefaultPath) {
     $DefaultPath = Join-Path $ServerDir "windrose_plus\config\windrose_plus.default.ini"
@@ -152,18 +160,46 @@ $historyFile = Join-Path $paksDir ".windroseplus_multiplier_history.json"
 $allowDowngrade = "$env:WINDROSEPLUS_ALLOW_DOWNGRADE".Trim().ToLowerInvariant() -in @("1","true","yes","on")
 
 function Save-MultiplierHistory {
-    param([hashtable]$History, [string]$Path)
+    param(
+        [hashtable]$History,
+        [string]$Path
+    )
+
     if (-not $History) { return }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw "Multiplier history path is empty."
+    }
+
+    $dir = Split-Path -Parent $Path
+    if ([string]::IsNullOrWhiteSpace($dir)) {
+        throw "Could not resolve parent directory for path: $Path"
+    }
+
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -LiteralPath $dir | Out-Null
+    }
+
     $tmp = "$Path.tmp"
+    $bak = "$Path.bak"
     $json = $History | ConvertTo-Json -Depth 2
-    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
-    if (Test-Path -LiteralPath $Path) {
-        # Atomic replace on NTFS (and most POSIX filesystems pwsh supports).
-        # Move-Item -Force is NOT a documented atomic primitive in PowerShell;
-        # [IO.File]::Replace IS atomic on Windows, [IO.File]::Move on first create.
-        [System.IO.File]::Replace($tmp, $Path, $null, $true) | Out-Null
-    } else {
-        [System.IO.File]::Move($tmp, $Path)
+
+    try {
+        Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
+
+        if (Test-Path -LiteralPath $Path) {
+            try {
+                [System.IO.File]::Replace($tmp, $Path, $null, $true) | Out-Null
+                Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+            } catch {
+                throw
+            }
+        } else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw
     }
 }
 
@@ -275,7 +311,7 @@ if ($blockedDowngrades.Count -gt 0) {
 # --- Read INI (CurveTables only) ---
 $iniConfig = $null
 $hasIniConfig = $false
-foreach ($path in $iniConfigPaths) {
+foreach ($path in $ctIniConfigPaths) {
     if (Test-Path -LiteralPath $path) {
         $hasIniConfig = $true
         break
@@ -304,6 +340,16 @@ $hasMultipliers = $false
 foreach ($prop in $multipliers.GetEnumerator()) {
     if ($prop.Key -eq "points_per_level") { continue }
     if ($prop.Value -ne 1.0) { $hasMultipliers = $true; break }
+}
+# windrose_plus.harvest.ini alone (no non-default value in windrose_plus.json)
+# also requires a Multipliers PAK. Read-HarvestIni is dot-sourced from
+# MultiplierPakBuilder.ps1.
+if (-not $hasMultipliers) {
+    $harvestIniPath = Join-Path $iniDir "windrose_plus.harvest.ini"
+    $perResourceHarvest = Read-HarvestIni -Path $harvestIniPath
+    foreach ($v in $perResourceHarvest.Values) {
+        if ($v -ne 1.0) { $hasMultipliers = $true; break }
+    }
 }
 $hasCT = ($ctConfig.Count -gt 0)
 

@@ -2,6 +2,65 @@
 
 ## [Unreleased]
 
+## [1.1.24] - 2026-05-05
+
+### Fixed
+
+- **53 orphan icon references in the bundled items catalog.** 13 unique icon basenames in `items_full.json` pointed to WebP files that don't exist (the upstream extraction missed them, and they don't exist on any public CDN either). Browser dev tools logged a 404 for each row that referenced one. The data fix sets `iconRef` to `null` for affected items so the row falls back to the empty-icon-slot path that the dashboard already handles cleanly. No more 404s in the network panel during the Items overlay flow.
+
+## [1.1.23] - 2026-05-05
+
+### Added
+
+- **Items catalog overlay on the embedded Sea Chart.** A new "Items" button on the dashboard's Sea Chart opens a slide-in panel listing every item in the game (378 entries) with name, rarity, stack size, drop-source count, and icon. Search by name / id / category / rarity. Click any item to drill into a detail view that shows the description and every drop source (NPC or chest, drop chance, quantity range). The catalog (1.3 MB JSON + 227 WebP icons, ~14 MB total) ships in `WindrosePlus.zip` under `server/web/catalog/v1/`, so the overlay works on offline / firewalled servers — no third-party CDN dependency. The catalog is generic Windrose game data, identical on every server.
+- **`/catalog/*` static-file route on the dashboard HTTP server.** Catalog assets serve without authentication so public Sea Chart viewers (`/public-map?token=...`) can browse the catalog too. The route uses canonical-path containment (`Path.GetFullPath` + ordinal-case `StartsWith` on the resolved catalog root) so a hostile request can't escape the catalog dir.
+
+### Notes
+
+- 53 items reference 14 icon basenames that don't ship with v1.1.23. Affected items still render in the list (with an empty icon slot); only the icon is missing. Will be filled in as the catalog re-extraction sweeps additional asset paths.
+- The `_summary.json` file in the catalog dir documents what was extracted and how many of each kind.
+
+## [1.1.22] - 2026-05-05
+
+### Fixed
+
+- **Server stuck in restart loop after a `Save-MultiplierHistory` write failure (#75).** When `[System.IO.File]::Replace` was called with an empty string for the backup-path argument, .NET threw `The value cannot be an empty string. (Parameter 'path')`, the build aborted with exit 4, and on Linux/Docker the container restarted into the same failure on every boot. `Save-MultiplierHistory` now passes `$null` for the backup argument (no `.bak` is created), validates the history-file path and parent directory up front (failing with a clear message instead of cascading into the Replace exception), and wraps the write in `try/catch` with `.tmp` cleanup on failure so a stale temp file can't haunt the next run. Thanks to @duhhbzz for the patch.
+
+## [1.1.21] - 2026-05-05
+
+### Fixed
+
+- **CurveTable parser drift on engine `0.10.0.5.x`.** The recent Windrose engine update changed the `CurveTable` serialization layout: the `int32 numRows` field that used to follow the property-block-terminator `None` FName was dropped. The old parser was reading the first row's FName index as `numRows`, walking only that many rows out of the actual N rows present. Symptom on affected files (`CT_OtherGEValues`, `CT_CharactersAttributes`, `CT_Mob_StatCorrection_CoopBased`, `CT_RestGameplayEffectCurves`, `CT_Weapon_GE_Values`, `CT_Food_GE_Values`, and others): only the first 9 rows would parse, the rest silently dropped, so any CurveTable-driven multiplier (swim damage, bleed DPS, weakness duration, hearth regen, weapon shared values, food regen) silently failed to apply at runtime. The parser now probes both layouts and walks rows until exhausted, terminating only when the next FName fails row-name validation. Validated against engine `0.10.0.5.120`: `CT_OtherGEValues` now reports 51 rows (was 9) and all critical sliders parse with correct byte offsets and values.
+
+## [1.1.20] - 2026-05-04
+
+### Fixed
+
+- **Game-directory detection on Windrose engine `0.10.0.5.120`.** Facepunch removed `R5\ServerDescription.json` from the dedicated server distribution in this update, which was the single sentinel WindrosePlus used to confirm a candidate path was the game root. Detection silently fell back to `.\` (process working directory), which on UE4SS sets `<gameRoot>\R5\Binaries\Win64\ue4ss\` — leaving every WindrosePlus path (`windrose_plus_data\`, RCON spool, status/livemap/POI writers) pointing inside `ue4ss\` where Apache's spawning user has no write permission. Symptom in `UE4SS.log`: `WARN: Could not detect game directory` followed by `windrose_plus_data not writable — activity log disabled`. The check now probes `R5\Content\Paks\pakchunk0-WindowsServer.pak` first and `R5\Binaries\Win64\WindroseServer-Win64-Shipping.exe` second; the legacy `ServerDescription.json` is kept as a third fallback so older self-hosted installs on `0.10.0.3.104` and earlier still match.
+- **`ExecuteInGameThread` queue starvation cascade triggered by the same engine update.** The `_readUe4ssSettings()` probe constructed its path as `gameDir + R5\Binaries\Win64\ue4ss\UE4SS-settings.ini`. When game-directory detection failed and `gameDir` was `.\`, that path resolved to a non-existent location nested two levels too deep — the read returned nil, `_detectExecuteInGameThread()` defaulted to "available", and dispatched closures piled up against `HookEngineTick = 0` / `HookUObjectProcessEvent = 0`. The queue starved at #46 and Query, LiveMap, and POIScan all dropped into degraded mode within ~24 seconds of boot. The settings probe now derives its absolute path from `debug.getinfo` so it stays decoupled from game-directory detection: a future engine bump that breaks the sentinels will not silently flip dispatcher detection from "hooks disabled" to "hooks unknown / assumed available".
+
+### Notes
+
+- PAK multipliers (loot, xp, harvest, inventory and friends) were unaffected by these bugs; the failure was localized to the Lua runtime layer.
+
+## [1.1.19] - 2026-05-04
+
+### Added
+
+- **Per-resource harvest yield via `windrose_plus.harvest.ini` (#53, #71).** Optional INI that adds per-resource multipliers stacking multiplicatively on top of `multipliers.harvest_yield`. Set `Wood = 5.0` + `harvest_yield = 1.0` to get 5x wood and 1x everything else; combine with a non-default `harvest_yield` to scale every resource by the base value and selected resources by an additional family-specific multiplier. Covers wood, bark, plant fiber, stone, clay, ash, sulfur, copper ore, iron, charcoal, and the foliage-table animal drops (feather, fat, leather, horns, bezoar). Family detection reads the `Resource_<Name>_T<digit>` token out of each loot entry's path and is case-insensitive. Contextual destroy scores (segmented trees → Wood, copper-cave digs → CopperOre, iron-cavern digs → Iron) are mapped to the same families so panel-driven harvest balance stays consistent across both loot tables and contextual spawners. Per-resource keys with zero matches surface a `Per-resource keys with zero matches` warning in BuildPak output so typos like `Wod = 5.0` don't silently no-op. Drops `windrose_plus.harvest.default.ini` as the template; rename to `.ini` to activate. Original implementation by @Nightreaver, follow-up patches and CT-list / diagnostic-warning fixes for shipping safety on top.
+
+### Fixed
+
+- **Harvest INI no longer trips the CurveTable parser.** The first cut of the per-resource harvest feature added `windrose_plus.harvest.ini` to the same INI list used to detect "is there CurveTable customization in play?" That made a harvest-only install (no entities/weapons/food/gear customization) report `ct_config_present = true` and emit a `Default INI missing; cannot evaluate CurveTable config` warning when `windrose_plus.default.ini` was absent. CT-relevant INIs and rebuild-input INIs are now tracked separately in both `WindrosePlus-BuildPak.ps1` and the `/api/pak-status` endpoint; harvest still invalidates the build hash so edits trigger a rebuild, but it no longer drives the CT detection path.
+- **`Read-HarvestIni` now warns on lines it can't parse.** A line like `Wood = 5x` (or any value that fails `[double]::TryParse`) used to be dropped silently, leaving customers wondering why their multiplier didn't take. The reader now emits a `Write-Warning` for both empty values (`Wood =`) and non-numeric values (`Wood = 5x`) so the misformatted line shows up in BuildPak's stderr output.
+
+## [1.1.18] - 2026-05-04
+
+### Added
+
+- **POIScan now also matches `BP_MarkerModel_*_C` actor classes.** The original `R5POIOverlapVolume` / `R5POIAudioVolume` filters captured the procgen-spawned POI volumes; the new entries (`BP_MarkerModel_ScenarioPOI_C`, `BP_MarkerModel_Quest_C`, `BP_MarkerModel_Simple_C`) capture the world-attached marker actors that mirror map-marker entries (scenario POIs, quest objectives, simple landmarks). Their actor names don't carry the `|I|...|P...|v...` pipe-encoded metadata, so structured fields stay nil for those entries — but the world transform via `K2_GetActorLocation` and the raw class + full actor name still get recorded, which is enough for a dashboard POI overlay.
+- **Per-class match counter in the POIScan output.** `pois.json` now includes a `class_counts` map alongside `kind_counts`, and the `poiscan.scan.done` event includes a `matched_classes` field. Both are indexed by the literal UE class name (`R5POIOverlapVolume`, `BP_MarkerModel_ScenarioPOI_C`, etc.) so server admins can see which actor classes are actually present in their world without re-grepping the daily JSONL.
+
 ## [1.1.17] - 2026-05-04
 
 ### Added
